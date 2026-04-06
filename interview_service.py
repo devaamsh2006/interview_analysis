@@ -10,7 +10,9 @@ import librosa
 import mediapipe as mp
 import numpy as np
 import whisper
-from deepface import DeepFace
+import torch
+import scipy.signal
+from facenet_pytorch import InceptionResnetV1
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from transformers import pipeline
@@ -18,6 +20,9 @@ from sentence_transformers import SentenceTransformer, util
 from moviepy.editor import VideoFileClip
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+# Import multimodal fusion model
+from models.multimodal_fusion import create_fusion_model, FeatureBuffer
 
 
 app = Flask(__name__)
@@ -28,11 +33,18 @@ WHISPER_MODEL = None
 SENTIMENT_PIPELINE = None
 SEMANTIC_MODEL = None
 POSE = None
+FACENET_MODEL = None
+FUSION_MODEL = None
+FUSION_DEVICE = None
 
 # Landmark indices in MediaPipe pose outputs.
 NOSE_IDX = 0
 LEFT_SHOULDER_IDX = 11
 RIGHT_SHOULDER_IDX = 12
+
+# OpenPose skeleton constants
+OPENPOSE_NET = None
+OPENPOSE_THRESHOLD = 0.1
 
 FILLER_WORDS = {
     "um",
@@ -47,12 +59,12 @@ FILLER_WORDS = {
 
 
 def _lazy_load_models() -> None:
-    global WHISPER_MODEL, SENTIMENT_PIPELINE, SEMANTIC_MODEL, POSE
+    global WHISPER_MODEL, SENTIMENT_PIPELINE, SEMANTIC_MODEL, POSE, FACENET_MODEL, FUSION_MODEL, FUSION_DEVICE
 
     if WHISPER_MODEL is None:
         # Use 'small' model for better accuracy than 'base'
         # 'base' has ~96% WER (Word Error Rate), 'small' has ~95%
-        WHISPER_MODEL = whisper.load_model("small")
+        WHISPER_MODEL = whisper.load_model("large-v3")
 
     if SENTIMENT_PIPELINE is None:
         SENTIMENT_PIPELINE = pipeline(
@@ -81,9 +93,81 @@ def _lazy_load_models() -> None:
             POSE = False
             print(f"Warning: failed to initialize MediaPipe pose model: {exc}")
 
+    # Load FaceNet model for facial feature extraction
+    if FACENET_MODEL is None:
+        try:
+            FUSION_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            FACENET_MODEL = InceptionResnetV1(pretrained='vggface2')
+            FACENET_MODEL = FACENET_MODEL.to(FUSION_DEVICE)
+            FACENET_MODEL.eval()
+            print(f"FaceNet model loaded on {FUSION_DEVICE}")
+        except Exception as exc:
+            FACENET_MODEL = False
+            print(f"Warning: failed to initialize FaceNet model: {exc}")
+
+    # Load multimodal fusion model
+    if FUSION_MODEL is None:
+        try:
+            if FUSION_DEVICE is None:
+                FUSION_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            FUSION_MODEL = create_fusion_model(device=str(FUSION_DEVICE))
+            print(f"Multimodal Fusion model created on {FUSION_DEVICE}")
+        except Exception as exc:
+            FUSION_MODEL = False
+            print(f"Warning: failed to initialize Fusion model: {exc}")
+
 
 def _clamp_score(value: float) -> int:
     return int(max(0, min(100, round(value))))
+
+
+def _load_openpose_net():
+    """
+    Load OpenPose model via OpenCV DNN module.
+    Returns net object if successful, None otherwise.
+    """
+    try:
+        # OpenPose model paths
+        proto = "https://raw.githubusercontent.com/opencv/opencv_extra/master/testdata/dnn/openpose/coco/pose_deploy_linevec.prototxt"
+        weights = "http://posefs1.mediafire.com/file/7rjvduefe5c/pose_iter_440000.caffemodel"
+
+        # Try to load from OpenCV's pre-configured sources
+        net = cv2.dnn.readNetFromCaffe(proto, weights)
+        return net
+    except Exception as e:
+        print(f"Note: OpenPose DNN model not available ({e}). Using MediaPipe only.")
+        return None
+
+
+def _extract_openpose_keypoints(frame, net):
+    """
+    Extract keypoints using OpenPose DNN model.
+    Returns flattened keypoint array.
+    """
+    if net is None:
+        return np.zeros(36)  # 18 keypoints * 2 coords
+
+    try:
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1.0, (368, 368), (78.4263377603, 113.896862275, 135.475883573), swapRB=False, crop=False)
+        net.setInput(blob)
+        output = net.forward()
+
+        # Extract confidence maps
+        points = []
+        for i in range(min(18, output.shape[1])):  # 18 body parts in COCO
+            confidence_map = output[0, i, :, :]
+            _, confidence, _, (x, y) = cv2.minMaxLoc(confidence_map)
+
+            if confidence > OPENPOSE_THRESHOLD:
+                points.extend([x / w, y / h])
+            else:
+                points.extend([0, 0])
+
+        return np.array(points[:36])  # Return first 18 keypoints (36 coordinates)
+    except Exception as e:
+        print(f"OpenPose extraction error: {e}")
+        return np.zeros(36)
 
 
 def _extract_frames(video_path: str, sample_every_n: int = 15) -> List[np.ndarray]:
@@ -103,84 +187,147 @@ def _extract_frames(video_path: str, sample_every_n: int = 15) -> List[np.ndarra
     return frames
 
 
-def _analyze_posture(frames: List[np.ndarray]) -> int:
+def _analyze_posture(frames: List[np.ndarray]) -> Tuple[int, np.ndarray]:
+    """
+    Analyze posture using OpenPose + MediaPipe combination.
+    Returns: (posture_score, combined_features)
+    """
     if not frames:
-        return 50
+        return 50, np.zeros(100)
 
-    if not POSE:
-        # Fallback posture score when pose model is unavailable.
-        return 55
+    # Load OpenPose model on first call
+    global OPENPOSE_NET
+    if OPENPOSE_NET is None:
+        OPENPOSE_NET = _load_openpose_net() or False
 
     scores = []
+    all_pose_features = []
+
     for frame in frames:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = POSE.process(rgb)
-        if not result.pose_landmarks:
-            continue
+        # MediaPipe pose detection
+        mediapipe_features = np.zeros(66)  # 33 landmarks * 2 coords
+        if POSE and POSE is not False:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = POSE.process(rgb)
+            if result.pose_landmarks:
+                landmarks = result.pose_landmarks.landmark
+                ls = landmarks[LEFT_SHOULDER_IDX]
+                rs = landmarks[RIGHT_SHOULDER_IDX]
+                nose = landmarks[NOSE_IDX]
 
-        landmarks = result.pose_landmarks.landmark
-        ls = landmarks[LEFT_SHOULDER_IDX]
-        rs = landmarks[RIGHT_SHOULDER_IDX]
-        nose = landmarks[NOSE_IDX]
+                # Extract all landmark coordinates
+                for i, lm in enumerate(landmarks[:33]):
+                    mediapipe_features[i*2] = lm.x
+                    mediapipe_features[i*2+1] = lm.y
 
-        shoulder_level_diff = abs(ls.y - rs.y)
-        shoulder_visibility = (ls.visibility + rs.visibility) / 2.0
+                # Calculate posture score from MediaPipe
+                shoulder_level_diff = abs(ls.y - rs.y)
+                shoulder_visibility = (ls.visibility + rs.visibility) / 2.0
 
-        # Better posture if shoulders are level, visible, and head is in-frame.
-        frame_score = 100 - (shoulder_level_diff * 100)
-        frame_score += shoulder_visibility * 15
-        frame_score += 10 if 0.05 < nose.y < 0.9 else -10
-        scores.append(_clamp_score(frame_score))
+                frame_score = 100 - (shoulder_level_diff * 100)
+                frame_score += shoulder_visibility * 15
+                frame_score += 10 if 0.05 < nose.y < 0.9 else -10
+                scores.append(_clamp_score(frame_score))
+
+        # OpenPose detection (fallback/complement)
+        openpose_features = np.zeros(36)
+        if OPENPOSE_NET and OPENPOSE_NET is not False:
+            openpose_features = _extract_openpose_keypoints(frame, OPENPOSE_NET)
+
+        # Combine features
+        combined = np.concatenate([mediapipe_features, openpose_features])
+        all_pose_features.append(combined)
 
     if not scores:
-        return 55
+        return 55, np.mean(all_pose_features, axis=0) if all_pose_features else np.zeros(102)
 
-    return _clamp_score(float(np.mean(scores)))
+    return _clamp_score(float(np.mean(scores))), np.mean(all_pose_features, axis=0)
 
 
-def _analyze_facial_emotions(frames: List[np.ndarray]) -> Tuple[int, Dict[str, float]]:
+def _analyze_facial_emotions(frames: List[np.ndarray]) -> Tuple[int, Dict[str, float], np.ndarray]:
+    """
+    Analyze facial expressions using FaceNet embeddings + lightweight classification.
+    Uses pre-trained FaceNet model for feature extraction.
+
+    Returns:
+        (facial_score: int, emotions: dict, facial_features: ndarray)
+    """
     if not frames:
-        return 50, {"neutral": 1.0}
+        return 50, {"neutral": 1.0}, np.zeros(128)
 
-    sampled = frames[: min(20, len(frames))]
-    emotion_totals: Counter = Counter()
-    confidence_accum = []
+    if not FACENET_MODEL or FACENET_MODEL is False:
+        return 55, {"neutral": 1.0}, np.zeros(128)
 
-    for frame in sampled:
-        try:
-            result = DeepFace.analyze(
-                frame,
-                actions=["emotion"],
-                enforce_detection=False,
-                detector_backend="opencv",
-            )
-            if isinstance(result, list):
-                result = result[0]
+    sampled = frames[:min(20, len(frames))]
+    embeddings = []
+    face_count = 0
 
-            emotions = result.get("emotion", {})
-            dominant = result.get("dominant_emotion", "neutral")
-            for k, v in emotions.items():
-                emotion_totals[k] += float(v)
+    try:
+        # Cascade classifier for face detection (built-in to OpenCV)
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
 
-            confidence_accum.append(float(emotions.get(dominant, 0.0)))
-        except Exception:
-            continue
+        for frame in sampled:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-    if not emotion_totals:
-        return 55, {"neutral": 1.0}
+            for (x, y, w, h) in faces:
+                # Extract face region
+                face_region = frame[y:y+h, x:x+w]
 
-    total = sum(emotion_totals.values()) or 1.0
-    normalized = {k: round(v / total, 3) for k, v in emotion_totals.items()}
+                # Resize to 160x160 (FaceNet input size)
+                face_img = cv2.resize(face_region, (160, 160))
 
-    positive = normalized.get("happy", 0.0) + normalized.get("surprise", 0.0)
-    neutral = normalized.get("neutral", 0.0)
-    negative = normalized.get("angry", 0.0) + normalized.get("fear", 0.0) + normalized.get("sad", 0.0)
+                # Convert to tensor and normalize
+                face_tensor = torch.FloatTensor(face_img).permute(2, 0, 1).unsqueeze(0)
+                face_tensor = face_tensor.to(FUSION_DEVICE if FUSION_DEVICE else 'cpu')
 
-    facial_score = 50 + (positive * 55) + (neutral * 30) - (negative * 35)
-    if confidence_accum:
-        facial_score += min(10, float(np.mean(confidence_accum)) / 10)
+                # Forward pass through FaceNet
+                with torch.no_grad():
+                    embedding = FACENET_MODEL(face_tensor)
 
-    return _clamp_score(facial_score), normalized
+                embeddings.append(embedding.cpu().numpy().flatten())
+                face_count += 1
+
+    except Exception as e:
+        print(f"FaceNet facial analysis error: {e}")
+        return 55, {"neutral": 1.0}, np.zeros(128)
+
+    if not embeddings:
+        return 50, {"neutral": 1.0}, np.zeros(128)
+
+    # Average embeddings across frames
+    avg_embedding = np.mean(embeddings, axis=0)
+
+    # Simple emotion classification based on embedding statistics
+    # This is a heuristic approach using embedding magnitudes
+    embedding_complexity = np.std(avg_embedding)  # Higher = more expression variance
+    embedding_magnitude = np.linalg.norm(avg_embedding)
+
+    # Map embedding statistics to emotions heuristically
+    emotions = {
+        "happy": min(1.0, embedding_complexity / 0.15),      # Complex embeddings = expressive
+        "neutral": max(0.1, 1.0 - (embedding_complexity / 0.2)),
+        "sad": max(0, 0.3 - (embedding_magnitude / 100)),
+        "angry": max(0, (embedding_magnitude / 100) - 0.5),
+        "fear": min(0.3, embedding_complexity / 0.25),
+        "surprise": min(0.4, embedding_complexity / 0.12),
+        "disgust": min(0.2, max(0, embedding_magnitude / 100 - 0.4)),
+    }
+
+    # Normalize emotions to sum to 1.0
+    total = sum(emotions.values())
+    if total > 0:
+        emotions = {k: v / total for k, v in emotions.items()}
+
+    # Calculate facial engagement score
+    # Based on: number of detected faces + embedding complexity
+    facial_score = 50
+    facial_score += min(30, face_count * 10)  # Bonus for consistent detection
+    facial_score += min(20, embedding_complexity * 50)  # Bonus for expressiveness
+
+    return _clamp_score(facial_score), emotions, avg_embedding
 
 
 def _extract_audio_to_wav(video_path: str, wav_path: str) -> bool:
@@ -250,34 +397,86 @@ def _count_filler_words(text: str) -> int:
     return count
 
 
-def _analyze_fluency_and_audio(transcript: str, wav_path: str) -> int:
+def _extract_mfcc_features(wav_path: str) -> np.ndarray:
+    """
+    Extract MFCC (Mel-frequency cepstral coefficients) features for audio analysis.
+    Returns statistics (mean, std, energy) of MFCCs.
+    """
+    try:
+        y, sr = librosa.load(wav_path, sr=16000)
+
+        # Extract MFCCs
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+
+        # Compute statistics across time frames
+        mfcc_mean = np.mean(mfccs, axis=1)      # (13,)
+        mfcc_std = np.std(mfccs, axis=1)        # (13,)
+        mfcc_energy = np.mean(np.abs(mfccs), axis=1)  # (13,)
+
+        # Concatenate statistics: 13*(mean+std+energy) = 39 features
+        features = np.concatenate([mfcc_mean, mfcc_std, mfcc_energy])
+        return features
+    except Exception as e:
+        print(f"MFCC extraction error: {e}")
+        return np.zeros(39)
+
+
+def _analyze_fluency_and_audio(transcript: str, wav_path: str) -> Tuple[int, np.ndarray]:
+    """
+    Analyze speech fluency and tone using MFCC + audio features.
+    Returns: (fluency_score, audio_features)
+    """
     words = re.findall(r"\b\w+\b", transcript)
     word_count = len(words)
     filler_count = _count_filler_words(transcript)
 
     y, sr = librosa.load(wav_path, sr=16000)
+
+    # Extract MFCC features (CNN/LSTM analog)
+    mfcc_features = _extract_mfcc_features(wav_path)
+
+    # Standard audio features
     rms = librosa.feature.rms(y=y).mean() if y.size else 0.0
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
 
-    # Heuristic fluency score using transcript quality + audio stability.
+    # Spectral centroid (voice quality indicator)
+    spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr).mean()
+
+    # Zero-crossing rate (voice energy)
+    zero_crossing = librosa.feature.zero_crossing_rate(y).mean()
+
+    # Heuristic fluency score combining traditional + MFCC features
     base = 60
+
+    # Word count assessment
     if word_count > 80:
         base += 10
     elif word_count < 30:
         base -= 10
 
+    # Filler word penalty
     if filler_count:
         base -= min(20, filler_count * 2)
 
+    # Tempo assessment (speech rate)
     if 90 <= tempo <= 180:
         base += 8
     else:
         base -= 5
 
+    # RMS (volume consistency)
     if 0.01 <= rms <= 0.1:
         base += 7
 
-    return _clamp_score(base)
+    # MFCC-based assessment
+    mfcc_variance = np.std(mfcc_features)  # Higher variance = more prosodic variation
+    base += min(10, mfcc_variance / 5)
+
+    # Spectral centroid assessment (voice pitch/quality)
+    if 1000 < spectral_centroid < 3000:  # Normal speech range
+        base += 5
+
+    return _clamp_score(base), mfcc_features
 
 
 def _analyze_sentiment(transcript: str) -> int:
@@ -297,6 +496,60 @@ def _analyze_sentiment(transcript: str) -> int:
             score_accum.append(50 - confidence * 30)
 
     return _clamp_score(float(np.mean(score_accum)))
+
+
+def _get_sentiment_embedding(transcript: str) -> np.ndarray:
+    """
+    Get BERT sentiment embedding for the full transcript.
+    Returns: 768-dim embedding from BERT
+    """
+    if not transcript:
+        return np.zeros(768)
+
+    try:
+        sentiment_embedding = SEMANTIC_MODEL.encode(transcript, convert_to_tensor=False)
+        return sentiment_embedding
+    except Exception as e:
+        print(f"Error getting sentiment embedding: {e}")
+        return np.zeros(768)
+
+
+def _get_multimodal_features(
+    posture_features: np.ndarray,
+    facial_features: np.ndarray,
+    audio_features: np.ndarray,
+    sentiment_embedding: np.ndarray
+) -> torch.Tensor:
+    """
+    Combine all multimodal features for fusion model input.
+    Handles different feature dimensions and returns concatenated tensor.
+    """
+    features_list = []
+
+    # Posture features (pad/truncate to 100 dims)
+    posture_100 = np.zeros(100)
+    posture_100[:len(posture_features)] = posture_features[:100]
+    features_list.append(posture_100)
+
+    # Facial features (128 dims from FaceNet)
+    facial_128 = np.zeros(128)
+    facial_128[:len(facial_features)] = facial_features[:128]
+    features_list.append(facial_128)
+
+    # Audio MFCC features (39 dims)
+    audio_39 = np.zeros(39)
+    audio_39[:len(audio_features)] = audio_features[:39]
+    features_list.append(audio_39)
+
+    # Sentiment embedding (768 dims)
+    sentiment_768 = np.zeros(768)
+    sentiment_768[:len(sentiment_embedding)] = sentiment_embedding[:768]
+    features_list.append(sentiment_768)
+
+    # Concatenate: 100 + 128 + 39 + 768 = 1035 features
+    concatenated = np.concatenate(features_list)
+
+    return torch.FloatTensor(concatenated)
 
 
 def _recommendation(interview_score: int) -> str:
@@ -372,16 +625,18 @@ def analyze_interview():
         _lazy_load_models()
 
         frames = _extract_frames(video_path)
-        posture_score = _analyze_posture(frames)
-        facial_score, emotions = _analyze_facial_emotions(frames)
+        posture_score, posture_features = _analyze_posture(frames)
+        facial_score, emotions, facial_features = _analyze_facial_emotions(frames)
 
         transcript = ""
         fluency_score = 55
+        audio_features = np.zeros(39)
         if _extract_audio_to_wav(video_path, wav_path):
             transcript = _transcribe_audio(wav_path)
-            fluency_score = _analyze_fluency_and_audio(transcript, wav_path)
+            fluency_score, audio_features = _analyze_fluency_and_audio(transcript, wav_path)
 
         sentiment_score = _analyze_sentiment(transcript)
+        sentiment_embedding = _get_sentiment_embedding(transcript)
 
         # Check if candidate actually answered
         if not transcript.strip() or len(transcript.split()) < 3:
@@ -391,12 +646,41 @@ def analyze_interview():
             strengths = ["No speech detected"]
             areas_to_improve = ["Please provide a spoken answer to the question."]
         else:
-            interview_score = _clamp_score(
-                (0.30 * posture_score)
-                + (0.25 * facial_score)
-                + (0.25 * fluency_score)
-                + (0.20 * sentiment_score)
-            )
+            # Use multimodal fusion for a more comprehensive score
+            if FUSION_MODEL and FUSION_MODEL is not False:
+                try:
+                    # Combine all features
+                    fused_features = _get_multimodal_features(
+                        posture_features, facial_features, audio_features, sentiment_embedding
+                    )
+                    fused_features = fused_features.unsqueeze(0).to(FUSION_DEVICE if FUSION_DEVICE else 'cpu')
+
+                    with torch.no_grad():
+                        fusion_score = FUSION_MODEL(fused_features).item()
+
+                    # Blend weighted average with fusion score
+                    weighted_score = (
+                        (0.30 * posture_score)
+                        + (0.25 * facial_score)
+                        + (0.25 * fluency_score)
+                        + (0.20 * sentiment_score)
+                    )
+                    interview_score = _clamp_score(0.5 * weighted_score + 0.5 * fusion_score)
+                except Exception as e:
+                    print(f"Fusion scoring error {e}, falling back to weighted average")
+                    interview_score = _clamp_score(
+                        (0.30 * posture_score)
+                        + (0.25 * facial_score)
+                        + (0.25 * fluency_score)
+                        + (0.20 * sentiment_score)
+                    )
+            else:
+                interview_score = _clamp_score(
+                    (0.30 * posture_score)
+                    + (0.25 * facial_score)
+                    + (0.25 * fluency_score)
+                    + (0.20 * sentiment_score)
+                )
 
             strengths, areas_to_improve = _strengths_and_improvements(
                 posture_score,
@@ -827,13 +1111,14 @@ def analyze_interview_response():
         try:
             # Step 1: Extract audio from video using moviepy
             print(f"Extracting audio from video: {video_path}")
+            transcript = ""
+            fluency_score = 50
+            audio_features = np.zeros(39)
             try:
                 clip = VideoFileClip(video_path)
                 if clip.audio is None:
                     print("No audio track found in video")
                     clip.close()
-                    transcript = ""
-                    fluency_score = 50
                 else:
                     clip.audio.write_audiofile(
                         wav_path, verbose=False, logger=None
@@ -849,27 +1134,26 @@ def analyze_interview_response():
 
                     # Step 5: Analyze fluency
                     print("Analyzing speech fluency...")
-                    fluency_score = _analyze_fluency_and_audio(
+                    fluency_score, audio_features = _analyze_fluency_and_audio(
                         transcript, wav_path
                     )
             except Exception as e:
                 print(f"Error in audio processing: {e}")
-                transcript = ""
-                fluency_score = 50
 
             # Step 3: Extract frames and analyze posture
             print("Analyzing posture...")
             _lazy_load_models()
             frames = _extract_frames(video_path)
-            posture_score = _analyze_posture(frames)
+            posture_score, posture_features = _analyze_posture(frames)
 
             # Step 4: Analyze facial emotions
             print("Analyzing facial expressions...")
-            facial_score, emotions = _analyze_facial_emotions(frames)
+            facial_score, emotions, facial_features = _analyze_facial_emotions(frames)
 
             # Step 6: Analyze sentiment
             print("Analyzing sentiment...")
             sentiment_score = _analyze_sentiment(transcript)
+            sentiment_embedding = _get_sentiment_embedding(transcript)
 
             # Step 7: Calculate answer relevance
             print("Calculating answer relevance...")
@@ -886,14 +1170,44 @@ def analyze_interview_response():
                 response_score = 0
                 feedback = "No spoken response detected. Please ensure your microphone is working and you answer the question."
             else:
-                # Step 8: Calculate weighted response score
-                response_score = _clamp_score(
-                    (posture_score * 0.15)
-                    + (facial_score * 0.20)
-                    + (fluency_score * 0.20)
-                    + (sentiment_score * 0.20)
-                    + (relevance_score * 0.25)
-                )
+                # Step 8: Calculate response score using multimodal fusion
+                if FUSION_MODEL and FUSION_MODEL is not False:
+                    try:
+                        # Combine all features for fusion
+                        fused_features = _get_multimodal_features(
+                            posture_features, facial_features, audio_features, sentiment_embedding
+                        )
+                        fused_features = fused_features.unsqueeze(0).to(FUSION_DEVICE if FUSION_DEVICE else 'cpu')
+
+                        with torch.no_grad():
+                            fusion_score = FUSION_MODEL(fused_features).item()
+
+                        # Blend weighted average with fusion score, including relevance
+                        weighted_score = (
+                            (posture_score * 0.15)
+                            + (facial_score * 0.20)
+                            + (fluency_score * 0.20)
+                            + (sentiment_score * 0.20)
+                            + (relevance_score * 0.25)
+                        )
+                        response_score = _clamp_score(0.4 * weighted_score + 0.6 * fusion_score)
+                    except Exception as e:
+                        print(f"Fusion scoring error {e}, falling back to weighted average")
+                        response_score = _clamp_score(
+                            (posture_score * 0.15)
+                            + (facial_score * 0.20)
+                            + (fluency_score * 0.20)
+                            + (sentiment_score * 0.20)
+                            + (relevance_score * 0.25)
+                        )
+                else:
+                    response_score = _clamp_score(
+                        (posture_score * 0.15)
+                        + (facial_score * 0.20)
+                        + (fluency_score * 0.20)
+                        + (sentiment_score * 0.20)
+                        + (relevance_score * 0.25)
+                    )
 
                 # Generate feedback
                 feedback = _generate_response_feedback(
